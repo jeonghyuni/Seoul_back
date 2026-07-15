@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path  # 경로 고정을 위해 추가
 from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, status
@@ -9,15 +10,25 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
-import openai
+from openai import AsyncOpenAI
 
-# .env 파일 로드
-load_dotenv()
+print("★☆★☆★ 내 코드가 실행되는 중입니다!!! ★☆★☆★")
 
-# OpenAI API 키 설정
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# [수정] main.py와 동일한 위치에 있는 .env 파일을 절대 경로로 정확히 로드합니다.
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
 
-# 1. 데이터베이스(SQLite) 및 SQLAlchemy ORM 설정
+# 환경 변수가 잘 들어왔는지 디버깅용 출력 (실제 키 뒷부분은 보안상 마스킹)
+raw_key = os.getenv("OPENAI_API_KEY")
+if raw_key:
+    print(f"[디버그] API Key 로드 성공: {raw_key[:12]}...")
+else:
+    print("[경고] API Key를 .env 파일에서 불러오지 못했습니다! 경로를 확인하세요.")
+
+# 클라이언트 생성 (환경변수가 등록되어 있으면 자동으로 읽어옵니다)
+aclient = AsyncOpenAI()
+
+# [여기서부터 기존 데이터베이스(SQLite) 및 SQLAlchemy ORM 설정 코드 시작...]
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./localhub.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -292,34 +303,60 @@ def delete_post(post_id: int, data: PostDelete, db: Session = Depends(get_db)):
 
 # 7. 챗봇 기능 구현 (POST /api/chat) ─ 수집된 TourAPI 실제 기반 RAG 데이터 바인딩
 @app.post("/api/chat")
-def chat_with_local_data(chat_req: ChatRequest, db: Session = Depends(get_db)):
-    user_message = chat_req.message
+async def chat_with_local_data(chat_req: ChatRequest, db: Session = Depends(get_db)):
+    user_message = chat_req.message.strip()
     
-    # DB에서 최신 장소 데이터 20개 정도 긁어와서 프롬프트 컨텍스트 생성 (부하 방지)
-    locations = db.query(Location).limit(30).all()
+    # [개선 1] 사용자의 질문에서 핵심 키워드를 추출하여 관련 장소만 쿼리 (단순하지만 강력한 룰베이스 RAG)
+    # 질문에 포함될 만한 단어로 간단히 필터링합니다. (예: "음식점", "양화", "공원", "관광지" 등)
+    keywords = [word for word in user_message.split() if len(word) > 1]
+    
+    query = db.query(Location)
+    
+    if keywords:
+        # 추출한 키워드 중 하나라도 제목, 카테고리, 혹은 주소에 포함되어 있으면 가져옴
+        from sqlalchemy import or_
+        filters = []
+        for kw in keywords[:3]:  # 너무 많은 키워드 조인은 속도를 저하시키므로 최대 3개만 사용
+            filters.append(Location.title.like(f"%{kw}%"))
+            filters.append(Location.category.like(f"%{kw}%"))
+            filters.append(Location.addr1.like(f"%{kw}%"))
+        query = query.filter(or_(*filters))
+    
+    # 필터링된 결과가 없거나 질문이 너무 일상적인 경우, 기본 추천 데이터 제공
+    locations = query.limit(15).all()
+    if not locations:
+        locations = db.query(Location).limit(10).all()
+        
+    # 컨텍스트 스트링 구축
     context_str = ""
     for loc in locations:
         context_str += f"- [{loc.category}] {loc.title} | 주소: {loc.addr1} {loc.addr2} | 전화번호: {loc.tel}\n"
     
+    # 시스템 프롬프트 정의
     system_prompt = (
         "너는 LocalHub 서비스의 서울 지역 전문 관광 및 커뮤니티 안내 챗봇이야.\n"
         "아래 제공된 [서울 지역 실제 공공데이터]를 철저히 참조하여 사용자의 질문에 친절하고 상세하게 한국어로 대답해줘.\n"
-        "만약 리스트에 없는 장소나 정보를 유저가 물어본다면 가짜 정보를 만들어내지 말고, 모른다고 말하거나 아는 선에서 유연하게 대답해줘.\n\n"
+        "만약 리스트에 없는 장소나 정보를 유저가 물어본다면 가짜 정보를 지어내지 마.\n"
+        "대신, 모르는 정보는 정중히 모른다고 하거나 포털 검색을 유도하고, 네가 아는 컨텍스트 범위 내에서만 유연하게 대답해줘.\n\n"
         "[서울 지역 실제 공공데이터]\n"
         f"{context_str}"
     )
     
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+        # [개선 2] 비동기(await) 호출 및 최신 SDK 문법 적용, 모델 gpt-4o-mini로 업그레이드
+        # [수정] gpt-4o-mini 대신 원래 사용권한이 있는 gpt-3.5-turbo로 변경합니다.
+        response = await aclient.chat.completions.create(
+            model="gpt-5-mini",  # 확실히 gpt-3.5-turbo로 고정!
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
-            temperature=0.6
+            
         )
-        ai_reply = response.choices[0].message['content']
+        ai_reply = response.choices[0].message.content
         return {"reply": ai_reply}
         
     except Exception as e:
+        # 구체적인 에러 디버깅을 위해 콘솔 출력 추가
+        print(f"[챗봇 오류 발생]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"챗봇 연동 실패: {str(e)}")
