@@ -12,7 +12,7 @@ from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-print("★☆★☆★ 내 코드가 실행되는 중입니다!!! ★☆★☆★")
+#print("★☆★☆★ 내 코드가 실행되는 중입니다!!! ★☆★☆★")
 
 # [수정] main.py와 동일한 위치에 있는 .env 파일을 절대 경로로 정확히 로드합니다.
 BASE_DIR = Path(__file__).resolve().parent
