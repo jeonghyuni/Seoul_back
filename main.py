@@ -2,17 +2,15 @@ import os
 import json
 from pathlib import Path  # 경로 고정을 위해 추가
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-
-#print("★☆★☆★ 내 코드가 실행되는 중입니다!!! ★☆★☆★")
 
 # [수정] main.py와 동일한 위치에 있는 .env 파일을 절대 경로로 정확히 로드합니다.
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,6 +31,13 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./localhub.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# 서울특별시 25개 자치구 목록 정의 (검증용 상수)
+SEOUL_DISTRICTS = {
+    "강남구", "강동구", "강북구", "강서구", "관악구", "광진구", "구로구", "금천구",
+    "노원구", "도봉구", "동대문구", "동작구", "마포구", "서대문구", "서초구", "성동구",
+    "성북구", "송파구", "양천구", "영등포구", "용산구", "은평구", "종로구", "중구", "중랑구"
+}
 
 # 2. DB 테이블 스키마(모델) 정의
 class Location(Base):
@@ -57,9 +62,10 @@ class Post(Base):
     title = Column(String, index=True)
     content = Column(Text)
     password = Column(String)                           # 요구사항: 평문 저장
+    district = Column(String, index=True, nullable=False) # [추가] 서울의 "구" 정보 저장 컬럼
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# DB 테이블 생성
+# DB 테이블 생성 (새로 추가한 district 컬럼이 SQLite에 자동 반영됩니다)
 Base.metadata.create_all(bind=engine)
 
 # DB 세션 의존성 함수
@@ -80,13 +86,12 @@ def seed_tour_data():
         db.close()
         return
 
-    # 2. 현재 실행 경로 디버깅 정보 출력 (매우 중요!)
+    # 2. 현재 실행 경로 디버깅 정보 출력
     current_working_dir = os.path.abspath(os.getcwd())
     print("\n==================================================")
     print(f"[디버그] 현재 터미널 실행 위치(현재 폴더): {current_working_dir}")
     print(f"[디버그] 현재 폴더 내부 파일들: {os.listdir('.')}")
     
-    # 상위 폴더도 분석해봅니다.
     parent_dir = os.path.abspath(os.path.join(".."))
     print(f"[디버그] 한 단계 위 상위 폴더: {parent_dir}")
     if os.path.exists(parent_dir):
@@ -97,18 +102,16 @@ def seed_tour_data():
     print("==================================================\n")
 
     # 3. 경로 후보군 설정
-    # localhub-backend와 '서울' 폴더가 워크스페이스 상에서 어떤 관계든 다 찾을 수 있도록 후보를 넓힙니다.
     search_paths = [
-        os.path.abspath(os.path.join("..", "서울")), # 1순위: 상위 폴더의 '서울'
-        os.path.abspath("서울"),                     # 2순위: 현재 폴더 안의 '서울'
-        os.path.abspath(os.path.join("data", "서울")),# 3순위: data/서울
-        os.path.abspath(".")                         # 4순위: 현재 폴더 자체
+        os.path.abspath(os.path.join("..", "서울")), 
+        os.path.abspath("서울"),                     
+        os.path.abspath(os.path.join("data", "서울")),
+        os.path.abspath(".")                         
     ]
 
     target_dir = None
     for path in search_paths:
         if os.path.exists(path):
-            # 해당 폴더 안에 .json 파일이 실제로 들어있는지 확인
             try:
                 files = os.listdir(path)
                 json_files = [f for f in files if f.endswith(".json")]
@@ -198,16 +201,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 5. Pydantic DTO 정의
+# 5. Pydantic DTO 정의 (검증 로직 포함)
 class PostCreate(BaseModel):
     title: str
     content: str
     password: str
+    district: str = Field(..., description="서울 자치구 이름 (예: 강남구, 서초구 등)")
+
+    @field_validator("district")
+    @classmethod
+    def validate_district(cls, v: str) -> str:
+        clean_v = v.strip()
+        if clean_v not in SEOUL_DISTRICTS:
+            raise ValueError(f"유효하지 않은 서울시 자치구 구역입니다. 올바른 예시: {', '.join(list(SEOUL_DISTRICTS)[:5])}...")
+        return clean_v
 
 class PostUpdate(BaseModel):
     title: str
     content: str
     password: str
+    district: str = Field(..., description="수정할 서울 자치구 이름")
+
+    @field_validator("district")
+    @classmethod
+    def validate_district(cls, v: str) -> str:
+        clean_v = v.strip()
+        if clean_v not in SEOUL_DISTRICTS:
+            raise ValueError(f"유효하지 않은 서울시 자치구 구역입니다.")
+        return clean_v
 
 class PostDelete(BaseModel):
     password: str
@@ -215,9 +236,7 @@ class PostDelete(BaseModel):
 class ChatRequest(BaseModel):
     message: str
 
-# 6. 커뮤니티 익명 CRUD API 구현
-
-# 아래 4줄을 추가해 줍니다!
+# 6. 기본 엔드포인트
 @app.get("/")
 def read_root():
     return {
@@ -230,26 +249,18 @@ def read_root():
 # [추가] 7개 카테고리 전체 통합 지원 - 지역 장소 정보 조회 API
 # =================================================================
 
-# 1. 카테고리별 장소 목록 조회 API (관광지, 레포츠, 쇼핑, 숙박 등 전체 지원)
 @app.get("/api/locations")
 def get_locations(category: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(Location)
-    
-    # 프론트가 특정 카테고리를 주면 DB에서 필터링해서 제공
     if category:
-        # 프론트엔드가 '맛집'이나 '축제·행사' 등 화면 한글 표기와 다르게 호출할 때 매핑해주는 안전장치
         if category == "맛집":
             category = "음식점"
         elif category in ["축제·행사", "축제", "축제공연행사"]:
             category = "축제공연행사"
             
         query = query.filter(Location.category == category)
-    
-    # 데이터가 너무 많으면 프론트가 렉 걸리므로, 우선 최대 100개만 가져오게 제한합니다.
     return query.limit(100).all()
 
-
-# 2. 특정 장소의 상세 정보만 조회하는 API (필요 시 연동)
 @app.get("/api/locations/{location_id}")
 def get_location_detail(location_id: int, db: Session = Depends(get_db)):
     location = db.query(Location).filter(Location.id == location_id).first()
@@ -257,11 +268,31 @@ def get_location_detail(location_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="장소 정보를 찾을 수 없습니다.")
     return location
 
-############추가완료
+# =================================================================
+# 6. 커뮤니티 익명 CRUD 및 구별 통계 API (정합성 최적화 버전)
+# =================================================================
+
+# [신규 추가] 구별 게시글 수 조회 API (정합성을 위해 실시간 Group By 쿼리 수행)
+@app.get("/api/posts/districts/count")
+def get_district_post_counts(db: Session = Depends(get_db)) -> Dict[str, int]:
+    # 실시간으로 DB에서 구별 개수를 COUNT합니다. (수정, 삭제 시 완벽 동기화 보장)
+    results = db.query(Post.district, func.count(Post.id)).group_by(Post.district).all()
+    
+    # 기본적으로 서울의 모든 25개 구를 0개로 초기화한 뒤, 매핑하여 반환합니다.
+    counts = {district: 0 for district in SEOUL_DISTRICTS}
+    for district, count in results:
+        if district in counts:
+            counts[district] = count
+            
+    return counts
 
 @app.get("/api/posts")
-def get_posts(db: Session = Depends(get_db)):
-    return db.query(Post).order_by(Post.created_at.desc()).all()
+def get_posts(district: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(Post)
+    # [기능 확장] 특정 구의 게시글만 필터링해서 받아볼 수 있도록 지원
+    if district:
+        query = query.filter(Post.district == district.strip())
+    return query.order_by(Post.created_at.desc()).all()
 
 @app.get("/api/posts/{post_id}")
 def get_post_detail(post_id: int, db: Session = Depends(get_db)):
@@ -275,12 +306,13 @@ def create_post(post_data: PostCreate, db: Session = Depends(get_db)):
     new_post = Post(
         title=post_data.title,
         content=post_data.content,
-        password=post_data.password
+        password=post_data.password,
+        district=post_data.district  # 구 데이터 할당
     )
     db.add(new_post)
     db.commit()
     db.refresh(new_post)
-    return {"message": "게시글이 성공적으로 등록되었습니다.", "post_id": new_post.id}
+    return {"message": "게시글이 성공적으로 등록되었습니다.", "post_id": new_post.id, "district": new_post.district}
 
 @app.put("/api/posts/{post_id}")
 def update_post(post_id: int, post_data: PostUpdate, db: Session = Depends(get_db)):
@@ -293,6 +325,7 @@ def update_post(post_id: int, post_data: PostUpdate, db: Session = Depends(get_d
     
     db_post.title = post_data.title
     db_post.content = post_data.content
+    db_post.district = post_data.district  # 수정 시 구 정보도 함께 갱신
     db.commit()
     return {"message": "게시글이 성공적으로 수정되었습니다."}
 
@@ -309,39 +342,32 @@ def delete_post(post_id: int, data: PostDelete, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "게시글이 성공적으로 삭제되었습니다."}
 
-
 # 7. 챗봇 기능 구현 (POST /api/chat) ─ 수집된 TourAPI 실제 기반 RAG 데이터 바인딩
 @app.post("/api/chat")
 async def chat_with_local_data(chat_req: ChatRequest, db: Session = Depends(get_db)):
     user_message = chat_req.message.strip()
     
-    # [개선 1] 사용자의 질문에서 핵심 키워드를 추출하여 관련 장소만 쿼리 (단순하지만 강력한 룰베이스 RAG)
-    # 질문에 포함될 만한 단어로 간단히 필터링합니다. (예: "음식점", "양화", "공원", "관광지" 등)
     keywords = [word for word in user_message.split() if len(word) > 1]
     
     query = db.query(Location)
     
     if keywords:
-        # 추출한 키워드 중 하나라도 제목, 카테고리, 혹은 주소에 포함되어 있으면 가져옴
         from sqlalchemy import or_
         filters = []
-        for kw in keywords[:3]:  # 너무 많은 키워드 조인은 속도를 저하시키므로 최대 3개만 사용
+        for kw in keywords[:3]:  
             filters.append(Location.title.like(f"%{kw}%"))
             filters.append(Location.category.like(f"%{kw}%"))
             filters.append(Location.addr1.like(f"%{kw}%"))
         query = query.filter(or_(*filters))
     
-    # 필터링된 결과가 없거나 질문이 너무 일상적인 경우, 기본 추천 데이터 제공
     locations = query.limit(15).all()
     if not locations:
         locations = db.query(Location).limit(10).all()
         
-    # 컨텍스트 스트링 구축
     context_str = ""
     for loc in locations:
         context_str += f"- [{loc.category}] {loc.title} | 주소: {loc.addr1} {loc.addr2} | 전화번호: {loc.tel}\n"
     
-    # 시스템 프롬프트 정의
     system_prompt = (
         "너는 LocalHub 서비스의 서울 지역 전문 관광 및 커뮤니티 안내 챗봇이야.\n"
         "아래 제공된 [서울 지역 실제 공공데이터]를 철저히 참조하여 사용자의 질문에 친절하고 상세하게 한국어로 대답해줘.\n"
@@ -352,20 +378,16 @@ async def chat_with_local_data(chat_req: ChatRequest, db: Session = Depends(get_
     )
     
     try:
-        # [개선 2] 비동기(await) 호출 및 최신 SDK 문법 적용, 모델 gpt-4o-mini로 업그레이드
-        # [수정] gpt-4o-mini 대신 원래 사용권한이 있는 gpt-3.5-turbo로 변경합니다.
         response = await aclient.chat.completions.create(
-            model="gpt-5-mini",  # 확실히 gpt-3.5-turbo로 고정!
+            model="gpt-5-mini",  # gpt-3.5-turbo로 명확하게 유지!
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
-            
         )
         ai_reply = response.choices[0].message.content
         return {"reply": ai_reply}
         
     except Exception as e:
-        # 구체적인 에러 디버깅을 위해 콘솔 출력 추가
         print(f"[챗봇 오류 발생]: {str(e)}")
         raise HTTPException(status_code=500, detail=f"챗봇 연동 실패: {str(e)}")
