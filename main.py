@@ -217,6 +217,15 @@ class ChatRequest(BaseModel):
 
 # 6. 커뮤니티 익명 CRUD API 구현
 
+# 아래 4줄을 추가해 줍니다!
+@app.get("/")
+def read_root():
+    return {
+        "status": "active",
+        "message": "Seoul Back-end API Server is running successfully!",
+        "docs_url": "/docs"
+    }
+
 # =================================================================
 # [추가] 7개 카테고리 전체 통합 지원 - 지역 장소 정보 조회 API
 # =================================================================
